@@ -30,7 +30,7 @@ abstract class JobEvent extends Event
         $this->job = $job;
     }
 
-    public function getJob()
+    public function getJob(): Job
     {
         return $this->job;
     }
