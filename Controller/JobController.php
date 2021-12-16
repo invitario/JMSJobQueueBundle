@@ -2,56 +2,93 @@
 
 namespace JMS\JobQueueBundle\Controller;
 
+use App\Entity\Account;
 use Doctrine\Common\Util\ClassUtils;
-use Doctrine\ORM\EntityManager;
+use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\ORM\Query\ResultSetMappingBuilder;
 use JMS\JobQueueBundle\Entity\Job;
 use JMS\JobQueueBundle\Entity\Repository\JobManager;
 use JMS\JobQueueBundle\View\JobFilter;
-use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\HttpException;
+use Symfony\Component\Routing\Annotation\Route;
 
 class JobController extends AbstractController
 {
+
+    /** @var EntityManagerInterface */
+    private $em;
+
+    /** @var JobManager */
+    private $jobManager;
+
+    /**
+     * DefaultController constructor.
+     * @param EntityManagerInterface $em
+     * @param JobManager $jobManager
+     */
+    public function __construct(EntityManagerInterface $em, JobManager $jobManager)
+    {
+        $this->em = $em;
+        $this->jobManager = $jobManager;
+    }
+
     /**
      * @Route("/", name = "jms_jobs_overview")
      */
-    public function overviewAction(Request $request)
+    public function overviewAction(Request $request): Response
     {
         $jobFilter = JobFilter::fromRequest($request);
 
-        $qb = $this->getEm()->createQueryBuilder();
-        $qb->select('j')->from('JMSJobQueueBundle:Job', 'j')
-            ->where($qb->expr()->isNull('j.originalJob'))
-            ->orderBy('j.id', 'desc');
-
-        $lastJobsWithError = $jobFilter->isDefaultPage() ? $this->getRepo()->findLastJobsWithError(5) : [];
-        foreach ($lastJobsWithError as $i => $job) {
-            $qb->andWhere($qb->expr()->neq('j.id', '?'.$i));
-            $qb->setParameter($i, $job->getId());
-        }
-
-        if ( ! empty($jobFilter->command)) {
-            $qb->andWhere($qb->expr()->orX(
-                $qb->expr()->like('j.command', ':commandQuery'),
-                $qb->expr()->like('j.args', ':commandQuery')
-            ))
-                ->setParameter('commandQuery', '%'.$jobFilter->command.'%');
-        }
-
-        if ( ! empty($jobFilter->state)) {
-            $qb->andWhere($qb->expr()->eq('j.state', ':jobState'))
-                ->setParameter('jobState', $jobFilter->state);
-        }
-
         $perPage = 50;
+        $lastJobsWithError = $jobFilter->isDefaultPage() ? $this->getRepo()->findLastJobsWithError(5) : [];
+        $queryParams = [];
 
-        $query = $qb->getQuery();
-        $query->setMaxResults($perPage + 1);
-        $query->setFirstResult(($jobFilter->page - 1) * $perPage);
+        $jobsWithErrorIdArray =array_map(
+            function ($i) {
+                return $i->getId();
+            },
+            $lastJobsWithError
+        );
+        $excludeErrorJobQuery = '';
+        if(count($jobsWithErrorIdArray) > 0) {
+            $excludeErrorJobQuery = 'AND j.id NOT IN(:excludeJobIds)';
+            $queryParams['excludeJobIds'] = $jobsWithErrorIdArray;
+        }
 
+        $searchQuery = '';
+        if ( ! empty($jobFilter->command)) {
+            $searchQuery = "AND (j.command LIKE(:commandSearchString) OR args::text LIKE(:commandSearchString))";
+            $queryParams['commandSearchString'] = '%' . $jobFilter->command . '%';
+        }
+
+        $stateQuery = '';
+        if ( ! empty($jobFilter->state)) {
+            $stateQuery = "AND j.state = :jobState";
+            $queryParams['jobState'] = $jobFilter->state;
+        }
+
+        $limit = $perPage + 1;
+        $offset = ($jobFilter->page - 1) * $perPage;
+
+        $rsm = new ResultSetMappingBuilder($this->getEm());
+        $rsm->addRootEntityFromClassMetadata(Job::class, 'job');
+        $query = $this->getEm()->createNativeQuery(/** @lang=SQL */ "
+            SELECT *
+            FROM jms_jobs j, json_array_elements_text(case when j.args::text = '[]' then '[null]'::json else j.args end) args
+            WHERE j.originaljob_id IS NULL
+            $excludeErrorJobQuery
+            $searchQuery
+            $stateQuery
+            ORDER BY j.id DESC
+            LIMIT $limit
+            OFFSET $offset
+        ", $rsm);
+
+        $query->setParameters($queryParams);
         $jobs = $query->getResult();
 
         return $this->render('@JMSJobQueue/Job/overview.html.twig', array(
@@ -66,7 +103,7 @@ class JobController extends AbstractController
     /**
      * @Route("/{id}", name = "jms_jobs_details")
      */
-    public function detailsAction(Job $job)
+    public function detailsAction(Job $job): Response
     {
         $relatedEntities = array();
         foreach ($job->getRelatedEntities() as $entity) {
@@ -127,7 +164,7 @@ class JobController extends AbstractController
     /**
      * @Route("/{id}/retry", name = "jms_jobs_retry_job")
      */
-    public function retryJobAction(Job $job)
+    public function retryJobAction(Job $job): RedirectResponse
     {
         $state = $job->getState();
 
@@ -149,13 +186,13 @@ class JobController extends AbstractController
         return new RedirectResponse($url, 201);
     }
 
-    private function getEm(): EntityManager
+    private function getEm(): EntityManagerInterface
     {
-        return $this->get('doctrine')->getManagerForClass(Job::class);
+        return $this->em;
     }
 
     private function getRepo(): JobManager
     {
-        return $this->get('jms_job_queue.job_manager');
+        return $this->jobManager;
     }
 }
